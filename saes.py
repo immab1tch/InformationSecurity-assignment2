@@ -50,6 +50,7 @@ S-AES (Simplified AES) 算法标准实现
 
 from __future__ import annotations
 
+import secrets
 from typing import Iterable, List, Sequence, Tuple
 
 # ----------------------------------------------------------------------------
@@ -473,7 +474,119 @@ def triple_decrypt_eee(ciphertext: int, key48: int) -> int:
 
 
 # ----------------------------------------------------------------------------
-# 七、自检
+# 七、第 5 关：密码分组链接（CBC）工作模式
+# ----------------------------------------------------------------------------
+#
+# CBC 模式用于加密较长的消息。16 位分组逐组链接：
+#     加密：C_i = E_K(P_i XOR C_{i-1})，其中 C_{-1} = IV（初始向量，16 位）
+#     解密：P_i = D_K(C_i) XOR C_{i-1}
+# IV 需随机生成，并由加解密双方共享（随密文一起传输或通过安全信道协商）。
+# 明文不足整分组时用 PKCS#7 填充（每分组 2 字节）。
+
+def generate_iv() -> int:
+    """生成随机 16 位初始向量（CBC 的 IV）。"""
+    return secrets.randbelow(0x10000)
+
+
+def block_to_bytes(block: int) -> bytes:
+    """16 位分组 -> 2 字节。"""
+    return bytes([(block >> 8) & 0xFF, block & 0xFF])
+
+
+def cbc_encrypt(data: bytes, key: int, iv: int) -> List[int]:
+    """
+    CBC 加密：对字节串按 2 字节分组、PKCS#7 填充后逐组链接加密。
+
+    返回 16 位密文分组列表，长度与填充后的分组数一致。
+    """
+    if not 0 <= iv <= 0xFFFF:
+        raise ValueError("初始向量 IV 必须为 16 位 (0~0xFFFF)")
+    padded = _pkcs7_pad(data, 2)
+    blocks = [(padded[i] << 8) | padded[i + 1] for i in range(0, len(padded), 2)]
+    out: List[int] = []
+    prev = iv
+    for b in blocks:
+        prev = encrypt(b ^ prev, key)
+        out.append(prev)
+    return out
+
+
+def cbc_decrypt(blocks: Sequence[int], key: int, iv: int, unpad: bool = True) -> bytes:
+    """
+    CBC 解密：逐组解出明文并去除 PKCS#7 填充。
+
+    unpad=False 时返回未去填充的原始字节（篡改分析时使用，避免填充校验干扰）。
+    """
+    if not 0 <= iv <= 0xFFFF:
+        raise ValueError("初始向量 IV 必须为 16 位 (0~0xFFFF)")
+    prev = iv
+    out = bytearray()
+    for c in blocks:
+        p = decrypt(c, key) ^ prev
+        out += block_to_bytes(p)
+        prev = c
+    raw = bytes(out)
+    return _pkcs7_unpad(raw, 2) if unpad else raw
+
+
+def cbc_encrypt_text(text: str, key: int, iv: int = None):
+    """
+    文本便捷封装：返回 (iv, 密文分组列表)。iv 为 None 时随机生成。
+    返回的 iv 需与密文一起共享给解密方。
+    """
+    if iv is None:
+        iv = generate_iv()
+    return iv, cbc_encrypt(text.encode("utf-8"), key, iv)
+
+
+def cbc_decrypt_text(blocks: Sequence[int], key: int, iv: int) -> str:
+    """文本便捷封装：CBC 解密后按 UTF-8 解码（错误处用替换字符呈现）。"""
+    return cbc_decrypt(blocks, key, iv).decode("utf-8", errors="replace")
+
+
+def tamper_block(blocks: Sequence[int], index: int, new_value: int = None) -> List[int]:
+    """
+    篡改演示辅助：返回新分组列表，将第 index 个密文分组替换为 new_value；
+    new_value 为 None 时对该分组按位取反（整体异或 0xFFFF）。
+    """
+    out = list(blocks)
+    if not 0 <= index < len(out):
+        raise ValueError(f"分组下标越界：{index}（共 {len(out)} 组）")
+    out[index] = (out[index] ^ 0xFFFF) if new_value is None else (new_value & 0xFFFF)
+    return out
+
+
+def cbc_error_propagation(plaintext: str, key: int, iv: int, tamper_index: int,
+                          new_value: int = None):
+    """
+    第 5 关实验：加密 -> 篡改第 tamper_index 个密文分组 -> 解密，返回对比数据。
+
+    new_value 为 None 时对该分组按位取反，否则替换为 new_value（16 位）。
+    返回 dict：
+        iv, cipher, tampered, plain_before, plain_after,
+        blocks_total, changed_blocks（明文发生变化的 16 位分组下标列表）
+    用于展示 CBC 的错误传播特性：篡改 C_i 会使 P_i 完全乱码、P_{i+1} 对应位翻转，
+    其余分组不受影响。
+    """
+    iv, cipher = cbc_encrypt_text(plaintext, key, iv)
+    tampered = tamper_block(cipher, tamper_index, new_value)
+    before = cbc_decrypt(cipher, key, iv, unpad=False)
+    after = cbc_decrypt(tampered, key, iv, unpad=False)
+    n = len(before) // 2
+    changed = [i for i in range(n) if before[2 * i:2 * i + 2] != after[2 * i:2 * i + 2]]
+    return {
+        "iv": iv,
+        "cipher": cipher,
+        "tampered": tampered,
+        "plain_before": before,
+        "plain_after": after,
+        "blocks_total": n,
+        "changed_blocks": changed,
+    }
+
+
+# ----------------------------------------------------------------------------
+# 八、自检
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":

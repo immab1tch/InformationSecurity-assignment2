@@ -15,6 +15,7 @@ S-AES 图形界面（Streamlit）
 
 from __future__ import annotations
 
+import re
 import time
 
 import streamlit as st
@@ -75,6 +76,40 @@ def show_trace(steps):
     st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
+def parse_iv(s: str) -> int:
+    """解析 16 位初始向量（16 位二进制或 4 位十六进制）。"""
+    s = "".join(s.split())
+    if s.startswith("0x"):
+        return saes.parse_hex(s, 16, "IV")
+    if len(s) == 16:
+        return saes.parse_bits(s, 16, "IV")
+    if len(s) == 4:
+        return saes.parse_hex(s, 16, "IV")
+    raise ValueError("IV 必须为 16 位二进制或 4 位十六进制")
+
+
+def parse_blocks(s: str) -> list:
+    """解析 CBC 密文分组（空格/逗号分隔或连续拼接的 4 位十六进制）。"""
+    parts = [p for p in re.split(r"[\s,]+", s.strip()) if p]
+    if len(parts) == 1 and len(parts[0].removeprefix("0x")) > 4:
+        raw = parts[0].removeprefix("0x")
+        parts = [raw[i:i + 4] for i in range(0, len(raw), 4)]
+    out = []
+    for part in parts:
+        h = part.removeprefix("0x").removeprefix("0X")
+        if len(h) != 4 or any(c not in "0123456789abcdefABCDEF" for c in h):
+            raise ValueError(f"密文分组须为 4 位十六进制: {part!r}")
+        out.append(int(h, 16))
+    if not out:
+        raise ValueError("密文分组为空")
+    return out
+
+
+def hex_blocks(data: bytes) -> str:
+    """字节串按 16 位分组（2 字节）显示为 4 位十六进制。"""
+    return " ".join(data[i:i + 2].hex() for i in range(0, len(data), 2))
+
+
 # ----------------------------------------------------------------------------
 # 侧边栏：算法说明
 # ----------------------------------------------------------------------------
@@ -98,8 +133,8 @@ with st.sidebar:
 # ----------------------------------------------------------------------------
 # 第 1 关：基本测试
 # ----------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["第1关 基本测试", "第2关 交叉测试", "第3关 ASCII 串", "第4关 多重加密"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["第1关 基本测试", "第2关 交叉测试", "第3关 ASCII 串", "第4关 多重加密", "第5关 CBC 工作模式"])
 
 with tab1:
     st.subheader("16 位数据加解密")
@@ -297,6 +332,87 @@ with tab4:
                 st.success(f"明文 P = {saes.to_bits(p, 16)} (hex {saes.to_hex(p, 16)})")
             except ValueError as e:
                 st.error(f"输入错误：{e}")
+
+# ----------------------------------------------------------------------------
+# 第 5 关：CBC 工作模式
+# ----------------------------------------------------------------------------
+with tab5:
+    st.subheader("第 5 关 工作模式：CBC（密码分组链接）")
+    st.markdown(
+        "对较长消息逐组链接加密：`C_i = E_K(P_i ⊕ C_{i-1})`，`P_i = D_K(C_i) ⊕ C_{i-1}`，"
+        "其中 `C_{-1} = IV`（16 位初始向量）。IV 随机生成后须与密文一并共享给解密方。")
+
+    key5 = st.text_input("密钥（16 位）", "0010110101010101", key="cbc_key")
+    text5 = st.text_area("明文消息（可较长，支持中文）",
+                         "S-AES CBC mode works on longer messages!", key="cbc_text")
+
+    st.markdown("---")
+    st.markdown("**① 加密：生成/共享 IV，输出密文分组**")
+    ev = st.text_input("IV（留空则随机生成）", "", key="cbc_e_iv",
+                       help="16 位二进制或 4 位十六进制；留空则每次随机生成")
+    if st.button("🔒 CBC 加密", use_container_width=True):
+        try:
+            k = parse_key(key5)
+            iv = parse_iv(ev) if ev.strip() else saes.generate_iv()
+            blocks = saes.cbc_encrypt(text5.encode("utf-8"), k, iv)
+            st.session_state["cbc_iv"] = iv
+            st.session_state["cbc_blocks"] = blocks
+            st.success(f"IV = {saes.to_bits(iv, 16)} ({saes.to_hex(iv, 16)})　密文共 {len(blocks)} 组")
+            st.code(" ".join(saes.to_hex(b, 16) for b in blocks), language="text")
+        except ValueError as e:
+            st.error(f"输入错误：{e}")
+
+    st.markdown("---")
+    st.markdown("**② 解密：必须使用加密方共享的同一 IV**")
+    dc1, dc2 = st.columns([1, 3])
+    with dc1:
+        d_iv = st.text_input("IV（16 位）",
+                             saes.to_hex(st.session_state.get("cbc_iv", 0), 16) if "cbc_iv" in st.session_state else "",
+                             key="cbc_d_iv")
+    with dc2:
+        d_ct = st.text_area("密文分组（空格分隔的 4 位十六进制）",
+                            " ".join(saes.to_hex(b, 16) for b in st.session_state.get("cbc_blocks", [])),
+                            key="cbc_d_ct")
+    if st.button("🔓 CBC 解密", use_container_width=True):
+        try:
+            k = parse_key(key5)
+            iv = parse_iv(d_iv)
+            blocks = parse_blocks(d_ct)
+            pt = saes.cbc_decrypt(blocks, k, iv)
+            st.success(f"明文：{pt.decode('utf-8', errors='replace')}")
+        except ValueError as e:
+            st.error(f"输入错误：{e}")
+
+    st.markdown("---")
+    st.markdown("**③ 篡改对比：修改一个密文分组后重新解密**")
+    st.markdown("CBC 特性：篡改第 *i* 组密文会使明文第 *i* 组整体乱码、第 *i+1* 组对应位翻转，其余分组不受影响；"
+                "若篡改末组，则 PKCS#7 填充被破坏，解密报填充错误。")
+    tc1, tc2 = st.columns([1, 1])
+    with tc1:
+        t_idx = st.number_input("要篡改的密文分组下标（0 起）", min_value=0, value=1, step=1, key="cbc_t_idx")
+    with tc2:
+        t_val = st.text_input("替换值（留空 = 按位取反）", "", key="cbc_t_val",
+                              help="16 位二进制或 4 位十六进制；留空则对该组密文异或 0xFFFF")
+    if st.button("⚡ 加密并篡改 → 对比解密结果", use_container_width=True):
+        try:
+            k = parse_key(key5)
+            iv = st.session_state.get("cbc_iv") if "cbc_iv" in st.session_state else saes.generate_iv()
+            nv = parse_iv(t_val) if t_val.strip() else None
+            r = saes.cbc_error_propagation(text5, k, iv, int(t_idx), nv)
+            st.markdown(f"- IV：`{saes.to_bits(iv, 16)}`（`{saes.to_hex(iv, 16)}`）")
+            st.markdown("**原密文分组**")
+            st.code(" ".join(saes.to_hex(b, 16) for b in r["cipher"]), language="text")
+            st.markdown(f"**篡改后密文分组**（第 {int(t_idx)} 组已被修改）")
+            st.code(" ".join(saes.to_hex(b, 16) for b in r["tampered"]), language="text")
+            st.markdown("**篡改前解密结果（16 位分组）**")
+            st.code(hex_blocks(r["plain_before"]), language="text")
+            st.markdown("**篡改后解密结果（16 位分组）**")
+            st.code(hex_blocks(r["plain_after"]), language="text")
+            ch = ", ".join(str(b) for b in r["changed_blocks"])
+            st.warning(f"受影响的明文字组：{ch}（共 {r['blocks_total']} 组）——"
+                       f"第 {int(t_idx)} 组乱码、第 {int(t_idx)+1} 组对应位翻转，其余分组不变。")
+        except ValueError as e:
+            st.error(f"输入错误：{e}")
 
 st.divider()
 st.caption("实现遵循 Musa, Schaefer & Wedig《A Simplified AES Algorithm》标准规格，详见 docs/开发手册.md")

@@ -19,12 +19,16 @@ S-AES 命令行工具（第 2 关交叉测试专用）
   python cli.py triple-encrypt  -k <32bit密钥> -p <16bit明文> --mode ede
   python cli.py triple-decrypt  -k <密钥> -c <16bit密文> --mode ede
   python cli.py mitm -p <明文1> -c <密文1> [-p2 <明文2> -c2 <密文2> ...]
+  python cli.py cbc-encrypt -k <16bit密钥> -t "较长明文..." [--iv <16bit IV>]
+  python cli.py cbc-decrypt -k <16bit密钥> --iv <16bit IV> -t "<密文分组>"
+  python cli.py cbc-tamper  -k <16bit密钥> -t "较长明文..." [-i <分组下标>] [--iv <IV>] [--value <替换值>]
   python cli.py vectors            # 打印标准测试向量供交叉比对
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 
 import saes
@@ -98,6 +102,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-p2", "--ptext2", help="第二组明文（可选，用于过滤误匹配）")
     sp.add_argument("-c2", "--ctext2", help="第二组密文（可选）")
 
+    # 第 5 关：CBC 工作模式
+    sp = sub.add_parser("cbc-encrypt", help="第5关：CBC 模式加密较长明文（IV 随机生成并由双方共享）")
+    add_fmt(sp)
+    sp.add_argument("-t", "--text", required=True, help="明文字符串")
+    sp.add_argument("--iv", help="16 位初始向量（16 位二进制或 4 位十六进制，省略则随机生成）")
+
+    sp = sub.add_parser("cbc-decrypt", help="第5关：CBC 模式解密（需与加密方共享的 IV）")
+    add_fmt(sp)
+    sp.add_argument("-t", "--text", required=True,
+                    help="密文分组（空格或逗号分隔的 4 位十六进制，可直接粘贴加密输出）")
+    sp.add_argument("--iv", required=True, help="16 位初始向量（16 位二进制或 4 位十六进制）")
+
+    sp = sub.add_parser("cbc-tamper", help="第5关：CBC 篡改实验（对比篡改密文前后的解密结果）")
+    add_fmt(sp)
+    sp.add_argument("-t", "--text", required=True, help="明文字符串")
+    sp.add_argument("--iv", help="16 位初始向量（省略则随机生成）")
+    sp.add_argument("-i", "--index", type=int, default=1, help="要篡改的密文分组下标，从 0 开始（默认 1）")
+    sp.add_argument("--value", help="替换值（16 位二进制或 4 位十六进制，省略则按位取反）")
+
     # 标准测试向量
     sub.add_parser("vectors", help="打印标准测试向量（供与其他小组交叉比对）")
     return p
@@ -105,6 +128,43 @@ def build_parser() -> argparse.ArgumentParser:
 
 def fmt_key(args) -> int:
     return parse_key16(args.key, args.fmt)
+
+
+def parse_iv_arg(s: str) -> int:
+    """解析初始向量：16 位二进制或 4 位十六进制。"""
+    s = "".join(s.split())
+    if s.startswith("0x"):
+        return saes.parse_hex(s, 16, "IV")
+    if len(s) == 16:
+        return saes.parse_bits(s, 16, "IV")
+    if len(s) == 4:
+        return saes.parse_hex(s, 16, "IV")
+    raise ValueError("IV 必须为 16 位二进制或 4 位十六进制")
+
+
+def parse_cbc_cipher(s: str) -> list:
+    """解析 CBC 密文分组：空格/逗号分隔的 4 位十六进制串，也支持连续拼接。"""
+    parts = [p for p in re.split(r"[\s,]+", s.strip()) if p]
+    if len(parts) == 1 and len(parts[0].removeprefix("0x")) > 4:
+        raw = parts[0].removeprefix("0x")
+        parts = [raw[i:i + 4] for i in range(0, len(raw), 4)]     # 无分隔符则每 4 位一切
+    blocks = []
+    for part in parts:
+        hexs = part.removeprefix("0x").removeprefix("0X")
+        if len(hexs) != 4 or any(ch not in "0123456789abcdefABCDEF" for ch in hexs):
+            raise ValueError(f"密文分组必须为 4 位十六进制: {part!r}")
+        blocks.append(int(hexs, 16))
+    if not blocks:
+        raise ValueError("密文分组为空")
+    return blocks
+
+
+def _fmt_blocks(blocks) -> str:
+    return " ".join(saes.to_hex(b, 16) for b in blocks)
+
+
+def _fmt_bytes_as_blocks(data: bytes) -> str:
+    return " ".join(data[i:i + 2].hex() for i in range(0, len(data), 2))
 
 
 def main(argv=None) -> int:
@@ -215,6 +275,46 @@ def main(argv=None) -> int:
                   f"32位密钥 {saes.to_bits(k32, 32)}")
         if len(found) != 1:
             print("提示：候选密钥多于 1 组，请增加更多明密文对（第二/第三组）以唯一确定密钥。")
+        return 0
+
+    if args.cmd == "cbc-encrypt":
+        key = fmt_key(args)
+        iv = parse_iv_arg(args.iv) if args.iv else saes.generate_iv()
+        data = args.text.encode("utf-8")
+        blocks = saes.cbc_encrypt(data, key, iv)
+        print(f"密钥       : {saes.to_bits(key, 16)} ({saes.to_hex(key, 16)})")
+        print(f"初始向量IV : {saes.to_bits(iv, 16)} ({saes.to_hex(iv, 16)})  ← 需与密文一并共享给解密方")
+        print(f"明文       : {args.text!r}（{len(data)} 字节，填充后 {len(blocks)} 组）")
+        print(f"密文分组   : {_fmt_blocks(blocks)}")
+        return 0
+
+    if args.cmd == "cbc-decrypt":
+        key = fmt_key(args)
+        iv = parse_iv_arg(args.iv)
+        blocks = parse_cbc_cipher(args.text)
+        pt = saes.cbc_decrypt(blocks, key, iv)
+        print(f"密钥       : {saes.to_bits(key, 16)} ({saes.to_hex(key, 16)})")
+        print(f"初始向量IV : {saes.to_bits(iv, 16)} ({saes.to_hex(iv, 16)})")
+        print(f"密文分组   : {_fmt_blocks(blocks)}（{len(blocks)} 组）")
+        print(f"明文       : {pt.decode('utf-8', errors='replace')!r}")
+        return 0
+
+    if args.cmd == "cbc-tamper":
+        key = fmt_key(args)
+        iv = parse_iv_arg(args.iv) if args.iv else saes.generate_iv()
+        new_value = parse_iv_arg(args.value) if args.value else None
+        r = saes.cbc_error_propagation(args.text, key, iv, args.index, new_value)
+        print(f"密钥          : {saes.to_bits(key, 16)} ({saes.to_hex(key, 16)})")
+        print(f"初始向量IV    : {saes.to_bits(iv, 16)} ({saes.to_hex(iv, 16)})")
+        print(f"明文          : {args.text!r}")
+        print(f"原密文分组    : {_fmt_blocks(r['cipher'])}")
+        print(f"篡改后密文分组: {_fmt_blocks(r['tampered'])}  （第 {args.index} 组被修改）")
+        print(f"篡改前解密    : {_fmt_bytes_as_blocks(r['plain_before'])}")
+        print(f"篡改后解密    : {_fmt_bytes_as_blocks(r['plain_after'])}")
+        changed = r["changed_blocks"]
+        nxt = args.index + 1
+        print(f"受影响明文分组: {changed}（共 {r['blocks_total']} 组）"
+              f" → 第 {args.index} 组整体乱码；第 {nxt} 组对应位翻转；其余分组不变")
         return 0
 
     if args.cmd == "vectors":

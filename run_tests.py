@@ -9,6 +9,7 @@ S-AES 通关测试脚本
   第 2 关 交叉测试   —— 标准向量表（供异构平台间比对）、加解密一致性
   第 3 关 扩展功能   —— ASCII 字符串分组加解密（含填充、中文、边界情况）
   第 4 关 多重加密   —— 4.1 双重加密；4.2 中间相遇攻击；4.3 三重加密(EDE/EEE)
+  第 5 关 工作模式   —— CBC：IV 生成与共享、长消息加解密、密文篡改前后解密对比
 
 运行：python run_tests.py
 全部通过时退出码为 0，否则为 1。
@@ -294,6 +295,87 @@ def test_level4() -> None:
 
 
 # ----------------------------------------------------------------------------
+# 第 5 关：工作模式（CBC）
+# ----------------------------------------------------------------------------
+def test_level5() -> None:
+    section("第 5 关 工作模式（CBC：IV 生成与共享、长消息加解密、密文篡改对比）")
+
+    key = 0x2D55
+
+    # IV 生成：16 位范围与随机性
+    ivs = {saes.generate_iv() for _ in range(200)}
+    record("第5关", "随机生成 16 位 IV（200 次全部在范围内且高度分散）",
+           all(0 <= v <= 0xFFFF for v in ivs) and len(ivs) > 150,
+           f"200 次生成 {len(ivs)} 个不同 IV")
+
+    # 长消息 CBC 往返（多种长度，含中文与 100 字节）
+    msgs = ["A", "hello", "S-AES CBC mode works on longer messages!",
+            "信息安全导论 课程作业 CBC 工作模式测试", "x" * 100]
+    ok = True
+    for m in msgs:
+        iv, c = saes.cbc_encrypt_text(m, key)
+        if saes.cbc_decrypt_text(c, key, iv) != m:
+            ok = False
+            break
+    record("第5关", "长消息 CBC 加解密往返（5 种长度，含中文/100 字节）", ok,
+           f"最长明文 100 字节 -> 51 组密文")
+
+    text = "S-AES CBC mode works on longer messages!"
+    iv, cipher = saes.cbc_encrypt_text(text, key, iv=0x1234)
+
+    # 分组长链：明文 40 字节 -> 21 组密文（末组含 PKCS#7 填充）
+    record("第5关", "长消息分组正确（40 字节明文 -> 21 组 16 位密文）",
+           len(cipher) == 21, f"共 {len(cipher)} 组")
+
+    # IV 必须共享：错误 IV 解密结果与原文不同
+    record("第5关", "IV 错误时解密结果与原文不同（说明 IV 必须双方共享）",
+           saes.cbc_decrypt_text(cipher, key, iv ^ 0x0001) != text)
+
+    # 可复现性与 IV 敏感性
+    iv_a, c_a = saes.cbc_encrypt_text(text, key, iv)
+    iv_b, c_b = saes.cbc_encrypt_text(text, key, iv ^ 0xFFFF)
+    record("第5关", "同明文同 IV 密文可复现；换 IV 后密文不同",
+           c_a == cipher and c_b != cipher)
+
+    # 篡改第 idx 组密文：错误传播（CBC 特性）
+    idx = 1
+    r = saes.cbc_error_propagation(text, key, iv, idx)
+    changed = sorted(r["changed_blocks"])
+    record("第5关", f"篡改第 {idx} 组密文：仅第 {idx}、{idx+1} 组明文受影响，其余 {r['blocks_total']-2} 组不变",
+           set(changed) == {idx, idx + 1}, f"受影响分组 {changed} / 共 {r['blocks_total']} 组")
+
+    # 被篡改组对应明文整体乱码（雪崩）
+    orig_blk = r["plain_before"][2 * idx:2 * idx + 2]
+    garb_blk = r["plain_after"][2 * idx:2 * idx + 2]
+    record("第5关", f"第 {idx} 组明文整体乱码（原 {orig_blk.hex()} -> {garb_blk.hex()}）",
+           orig_blk != garb_blk and garb_blk != b"\x00\x00")
+
+    # 第 idx+1 组：与篡改位一一对应（异或 0xFFFF）
+    o2 = r["plain_before"][2 * (idx + 1):2 * (idx + 1) + 2]
+    t2 = r["plain_after"][2 * (idx + 1):2 * (idx + 1) + 2]
+    xor2 = bytes(a ^ b for a, b in zip(o2, t2))
+    record("第5关", f"第 {idx+1} 组明文按位翻转（XOR = {xor2.hex()}，即 0xFFFF）",
+           xor2 == b"\xff\xff")
+
+    # 替换（赋新值）第 2 组密文：受影响范围同样只波及相邻两组
+    r2 = saes.cbc_error_propagation(text, key, iv, 2, 0x0000)
+    ch2 = sorted(r2["changed_blocks"])
+    record("第5关", "以新值替换第 2 组密文：受影响分组仍为 {2,3}，后续分组不受影响",
+           set(ch2) == {2, 3}, f"受影响分组 {ch2}")
+
+    # 篡改末组密文：破坏 PKCS#7 填充，接收方无法通过填充校验
+    n = r["blocks_total"]
+    r3 = saes.cbc_error_propagation(text, key, iv, n - 1)
+    record("第5关", "篡改末组密文：末组明文改变，PKCS#7 填充被破坏",
+           r3["changed_blocks"] == [n - 1],
+           f"受影响分组 {r3['changed_blocks']}（末组填充不再合法，解密报填充错误）")
+
+    # 结论性对比：篡改前后可读明文
+    print(f"  ℹ INFO | 篡改前明文：{text!r}")
+    print(f"  ℹ INFO | 篡改后明文：{saes.cbc_decrypt_text(r['tampered'], key, iv)!r}（第 {idx} 组乱码、第 {idx+1} 组对应位变化）")
+
+
+# ----------------------------------------------------------------------------
 # 汇总
 # ----------------------------------------------------------------------------
 def summary() -> int:
@@ -305,7 +387,7 @@ def summary() -> int:
             print(f"  {FAIL} | [{level}] {name} ｜ {detail}")
     print(f"\n  通过 {passed}/{total} 项测试。")
     if passed == total:
-        print("  🎉 四个关卡全部通关！")
+        print("  🎉 五个关卡全部通关！")
     return 0 if passed == total else 1
 
 
@@ -317,4 +399,5 @@ if __name__ == "__main__":
     test_level2()
     test_level3()
     test_level4()
+    test_level5()
     sys.exit(summary())
